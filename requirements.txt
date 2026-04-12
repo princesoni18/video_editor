@@ -1,0 +1,99 @@
+# requirements.txt
+openai-whisper
+watchdog
+python-telegram-bot==20.7
+mediapipe==0.10.9
+opencv-python
+torch
+torchvision
+torchaudio
+diffusers
+transformers
+accelerate
+xformers
+requests
+Pillow
+ffmpeg-python
+
+# ════════════════════════════════════════════════════════════
+# SETUP GUIDE — Smart AI Shorts Bot
+# ════════════════════════════════════════════════════════════
+#
+# STEP 1 — Install FFmpeg (adds to PATH)
+#   winget install Gyan.FFmpeg
+#
+# STEP 2 — Install Python packages (CUDA 12.1 build of torch)
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+#   pip install -r requirements.txt
+#
+# STEP 3 — Install Ollama and pull Gemma 4
+#   Download: https://ollama.com/download/windows
+#   Then run:
+#     ollama pull gemma3:27b      (needs ~18GB VRAM — RTX 3090/4090)
+#     ollama pull gemma3:12b      (needs ~9GB VRAM  — RTX 3060/3070/3080)
+#     ollama pull gemma3:4b       (needs ~4GB VRAM  — lighter GPUs)
+#
+# STEP 4 — Create your Telegram bot
+#   1. Open Telegram, search @BotFather
+#   2. Send /newbot, follow prompts
+#   3. Copy the bot token
+#   4. Set environment variable:
+#      set TELEGRAM_BOT_TOKEN=your_token_here
+#      (or paste directly into bot.py)
+#
+# STEP 5 — Run the bot
+#   python bot.py
+#
+# ════════════════════════════════════════════════════════════
+# FILE STRUCTURE
+# ════════════════════════════════════════════════════════════
+#
+# shorts_bot/
+# ├── bot.py           ← Telegram bot, entry point
+# ├── pipeline.py      ← Main orchestrator
+# ├── gemma_brain.py   ← Gemma 4 via Ollama (smart decisions)
+# ├── face_tracker.py  ← MediaPipe speaker tracking
+# ├── image_gen.py     ← Stable Diffusion b-roll generation
+# ├── effects.py       ← FFmpeg filters, captions, transitions
+# └── requirements.txt ← This file
+#
+# ════════════════════════════════════════════════════════════
+# HOW TO USE
+# ════════════════════════════════════════════════════════════
+#
+# 1. Run: python bot.py
+# 2. Open your Telegram bot
+# 3. Send any video (up to ~50MB via Telegram)
+# 4. Wait 2-4 minutes depending on GPU
+# 5. Bot replies with edited Short + summary of what Gemma decided
+#
+# For larger files:
+#   - Use a cloud storage link approach (share Google Drive link)
+#   - Or run locally and process files directly
+#
+# ════════════════════════════════════════════════════════════
+# GPU VRAM REQUIREMENTS
+# ════════════════════════════════════════════════════════════
+#
+# Component         VRAM needed
+# ─────────────────────────────
+# Whisper medium    ~3 GB
+# Gemma 3:12b       ~9 GB      (runs via Ollama separately)
+# Stable Diffusion  ~4 GB      (loads/unloads as needed)
+# FFmpeg NVENC      ~1 GB
+#
+# Total peak: ~8 GB (Gemma offloads while SD runs)
+# Recommended: RTX 3060 12GB or better
+# For 8GB cards: use gemma3:4b + whisper small
+#
+# ════════════════════════════════════════════════════════════
+# WHAT GEMMA 4 DECIDES AUTOMATICALLY
+# ════════════════════════════════════════════════════════════
+#
+# - Style: energetic / calm / educational / funny
+# - Hook text: punchy opener shown at start of Short
+# - Caption highlight colour: matches video vibe
+# - Cut points: where to make natural edits
+# - B-roll prompts: what images to generate and when
+# - Energy map: zoom punch timing based on speech peaks
+# - Suggested trim: best part of longer videos
