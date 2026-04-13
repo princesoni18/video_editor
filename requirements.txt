@@ -26,7 +26,7 @@ ffmpeg-python
 #   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 #   pip install -r requirements.txt
 #
-# STEP 3 — Install Ollama and pull Gemma 4
+# STEP 3 — Install Ollama and pull Gemma 3:4B
 #   Download: https://ollama.com/download/windows
 #   Then run:
 #     ollama pull gemma3:27b      (needs ~18GB VRAM — RTX 3090/4090)
@@ -51,7 +51,7 @@ ffmpeg-python
 # shorts_bot/
 # ├── bot.py           ← Telegram bot, entry point
 # ├── pipeline.py      ← Main orchestrator
-# ├── gemma_brain.py   ← Gemma 4 via Ollama (smart decisions)
+# ├── gemma_brain.py   ← Gemma 3:4B via Ollama (smart decisions)
 # ├── face_tracker.py  ← MediaPipe speaker tracking
 # ├── image_gen.py     ← Stable Diffusion b-roll generation
 # ├── effects.py       ← FFmpeg filters, captions, transitions
@@ -87,7 +87,7 @@ ffmpeg-python
 # For 8GB cards: use gemma3:4b + whisper small
 #
 # ════════════════════════════════════════════════════════════
-# WHAT GEMMA 4 DECIDES AUTOMATICALLY
+# WHAT GEMMA 3:4B DECIDES AUTOMATICALLY
 # ════════════════════════════════════════════════════════════
 #
 # - Style: energetic / calm / educational / funny

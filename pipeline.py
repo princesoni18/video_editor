@@ -16,7 +16,7 @@ import whisper as whisper_lib
 from gemma_brain  import analyze, EditDecision
 from face_tracker import get_face_crop_path, export_crop_filter
 from image_gen    import generate_all_broll
-from effects      import build_ass, zoom_punch_filter, color_grade_filter, hook_drawtext_filter
+from effects      import build_ass, build_zoom_filter, color_grade_filter, hook_drawtext_filter
 
 log = logging.getLogger(__name__)
 
@@ -114,11 +114,25 @@ def run_pipeline(input_path: str, output_path: str, user_prefs: dict = None) -> 
 
     # ── 5. Build ASS captions ────────────────────────────────────────────────
     log.info("[pipeline] Step 5: Building captions")
-    c_color  = user_prefs.get("color", decision.caption_color)
-    c_font   = user_prefs.get("font", "Montserrat")
-    c_size   = user_prefs.get("size", "Large")
-    c_border = user_prefs.get("border", "Black")
-    ass_content = build_ass(words, c_color, c_font, c_size, c_border, video_w=1080, video_h=1920)
+    c_color     = user_prefs.get("color",     decision.caption_color)
+    c_font      = user_prefs.get("font",      "Montserrat")
+    c_size      = user_prefs.get("size",      "Large")
+    c_border    = user_prefs.get("border",    "Black")
+    c_animation = user_prefs.get("animation", "Pop")
+    c_style     = user_prefs.get("style",     "Submagic")
+
+    # Gemma-supplied emphasis indices and emoji map
+    emphasis_indices = set(getattr(decision, "emphasis_word_indices", []))
+    emoji_map        = getattr(decision, "emoji_map", {})
+
+    ass_content = build_ass(
+        words, c_color, c_font, c_size, c_border,
+        emphasis_indices = emphasis_indices,
+        emoji_map        = emoji_map,
+        c_animation      = c_animation,
+        c_style          = c_style,
+        video_w=1080, video_h=1920,
+    )
     ass_path = str(work / "captions.ass")
     with open(ass_path, "w", encoding="utf-8") as f:
         f.write(ass_content)
@@ -154,14 +168,27 @@ def run_pipeline(input_path: str, output_path: str, user_prefs: dict = None) -> 
     _run(ffmpeg_crop_cmd, "dynamic_crop")
 
     # ── 8. Apply effects + captions (main pass) ──────────────────────────────
-    log.info("[pipeline] Step 8: Effects + captions (zoom & hook removed)")
+    log.info("[pipeline] Step 8: Effects + captions (zoom + captions)")
     effected = str(work / "effected.mp4")
 
     ass_esc  = ass_path.replace("\\","/").replace(":",r"\:")
     captions = f"ass='{ass_esc}'"
 
-    # Chain all video filters (only captions)
-    vf_chain = captions
+    # Build Gemma-directed zoom filter.
+    # Shift zoom_cuts timestamps so they are relative to the trimmed clip.
+    trimmed_zoom_cuts = []
+    for zc in decision.zoom_cuts:
+        t_shifted = zc["time"] - trim_start
+        if 0 <= t_shifted <= (trim_end - trim_start):
+            trimmed_zoom_cuts.append({**zc, "time": t_shifted})
+
+    trimmed_duration = trim_end - trim_start
+    zoom_filter = build_zoom_filter(trimmed_zoom_cuts, trimmed_duration, fps=fps)
+    log.info(f"[pipeline] Zoom filter built for {len(trimmed_zoom_cuts)} cuts")
+
+    # zoompan must come BEFORE ass subtitles so the zoom doesn't crop the text.
+    # zoompan is CPU-only — hwaccel decode is still fine.
+    vf_chain = f"{zoom_filter},{captions}" 
 
     # Audio: normalize loudness + boost speech clarity
     af_chain = "loudnorm=I=-14:TP=-2:LRA=7,equalizer=f=3000:width_type=o:width=2:g=3"

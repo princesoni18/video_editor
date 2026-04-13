@@ -1,31 +1,29 @@
 """
-gemma_brain.py — Gemma 3n E4B via Ollama (multimodal)
+gemma_brain.py — Gemma 3:4B via Ollama (multimodal)
 Sends video keyframes + transcript → smart editing decisions as JSON
 
-Gemma 3n E4B uses selective parameter activation:
-  - 6.87B total params, ~4B effective VRAM cost
+Gemma 3:4B is a lightweight multimodal model:
+  - 4B parameters, ~3GB VRAM cost
   - Multimodal: reads images + text together
   - 128K context window
-  - Pulls ~7.5GB: ollama pull gemma4:e4b
+  - Pull command: ollama pull gemma3:4b
 """
 
 import json, re, base64, logging, cv2
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import requests
 import numpy as np
 
 log = logging.getLogger(__name__)
 
-OLLAMA_URL  = "http://localhost:11434/api/chat"   # chat endpoint supports images
-GEMMA_MODEL = "gemma4:e4b"
+OLLAMA_URL  = "http://localhost:11434/api/chat"
+GEMMA_MODEL = "gemma3:4b"
 
 # How many keyframes to sample from the video and send to Gemma
 # More = smarter decisions, slower inference. 6 is a good balance.
 N_KEYFRAMES = 6
-
-
 
 
 # ─────────────────────────────────────────────────────────────
@@ -40,10 +38,27 @@ class EditDecision:
     caption_font: str    # "bold" | "rounded" | "minimal"
     cut_points: list     # [float, ...] timestamps for cuts
     broll_prompts: list  # [{time, prompt, duration}, ...]
-    energy_map: list     # [{time, energy: "low|high|peak"}, ...]
+    energy_map: list     # [{time, energy: "low|high|peak"}, ...]  (kept for compat)
     suggested_trim: dict # {start: float, end: float}
-    scene_description: str  # Gemma's visual read of the video
-    visual_style: str       # Gemma's colour/aesthetic observation
+    scene_description: str
+    visual_style: str
+
+    # ── NEW ──────────────────────────────────────────────────
+    # Gemma-directed zoom instructions.
+    # Each entry:  { "time": float,   ← when to start the zoom (seconds, in trimmed timeline)
+    #                "zoom": float,   ← target zoom level, e.g. 1.0 = normal, 1.06 = punch in
+    #                "duration": float } ← how long to hold / transition (seconds)
+    #
+    # The list must be sorted by time.  pipeline.py passes this directly to
+    # build_zoom_filter() in effects.py which converts it to an FFmpeg zoompan expression.
+    zoom_cuts: list = field(default_factory=list)
+
+    # Gemma-flagged word indices (into transcript word list) to show ALONE
+    # as big emphasis captions. Sparse — max ~1 per 8–10 words.
+    emphasis_word_indices: list = field(default_factory=list)
+
+    # word_index → emoji string. Max 3 total across the whole video.
+    emoji_map: dict = field(default_factory=dict)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -60,7 +75,6 @@ def _extract_keyframes(video_path: str, n: int = N_KEYFRAMES) -> list[str]:
     fps      = cap.get(cv2.CAP_PROP_FPS) or 30
     duration = total / fps
 
-    # Skip first/last 2s — usually boring intros/outros
     margin     = min(2.0, duration * 0.05)
     sample_pts = np.linspace(margin, duration - margin, n)
 
@@ -71,10 +85,9 @@ def _extract_keyframes(video_path: str, n: int = N_KEYFRAMES) -> list[str]:
         if not ret:
             continue
 
-        # Resize to 512px wide — enough for visual understanding, keeps token count low
-        h, w = frame.shape[:2]
-        scale = 512 / w
-        frame = cv2.resize(frame, (512, int(h * scale)))
+        h, w   = frame.shape[:2]
+        scale  = 512 / w
+        frame  = cv2.resize(frame, (512, int(h * scale)))
 
         ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
         if ok:
@@ -105,11 +118,54 @@ def _extract_json(raw: str) -> dict:
         except json.JSONDecodeError:
             pass
 
-    # Last resort: truncate at last closing brace
     try:
         return json.loads(raw[:raw.rfind("}") + 1])
     except Exception:
         raise ValueError(f"Could not extract JSON from:\n{raw[:400]}")
+
+
+# ─────────────────────────────────────────────────────────────
+#  ZOOM CUTS VALIDATOR
+# ─────────────────────────────────────────────────────────────
+
+def _validate_zoom_cuts(raw_cuts: list, duration: float) -> list:
+    """
+    Sanitise Gemma's zoom_cuts output:
+      - Clamp zoom to [1.0, 1.10]  (above 1.10 crops too aggressively on 9:16)
+      - Clamp time to [0, duration]
+      - Clamp duration to [0.3, 4.0]
+      - Sort by time
+      - Ensure gaps between cuts ≥ 1.5 s so zooms don't stack confusingly
+      - Max 8 zoom cuts for a Short
+    """
+    if not isinstance(raw_cuts, list):
+        return []
+
+    validated = []
+    for item in raw_cuts:
+        try:
+            t   = float(item.get("time", 0))
+            z   = float(item.get("zoom", 1.0))
+            dur = float(item.get("duration", 1.0))
+        except (TypeError, ValueError):
+            continue
+
+        t   = max(0.0, min(t, duration - 0.5))
+        z   = max(1.0, min(z, 1.10))
+        dur = max(0.3, min(dur, 4.0))
+        validated.append({"time": t, "zoom": z, "duration": dur})
+
+    # Sort by time
+    validated.sort(key=lambda x: x["time"])
+
+    # Remove cuts that are too close to each other
+    filtered = []
+    for cut in validated:
+        if filtered and cut["time"] - filtered[-1]["time"] < 1.5:
+            continue
+        filtered.append(cut)
+
+    return filtered[:8]
 
 
 # ─────────────────────────────────────────────────────────────
@@ -119,12 +175,7 @@ def _extract_json(raw: str) -> dict:
 def analyze(transcript_words: list[dict], duration: float,
             video_path: str | None = None) -> EditDecision:
     """
-    Send keyframes + transcript to Gemma 3n E4B for multimodal editing analysis.
-
-    Args:
-        transcript_words: [{word, start, end}, ...]
-        duration:         video length in seconds
-        video_path:       source video path for keyframe extraction (None = text-only)
+    Send keyframes + transcript to Gemma 3:4B for multimodal editing analysis.
     """
 
     # Build timed transcript
@@ -152,10 +203,10 @@ def analyze(transcript_words: list[dict], duration: float,
 
     vision_note = (
         f"I am sending you {len(frames_b64)} keyframes from the video. "
-        f"Use them to visually understand the scene, speaker energy, setting, "
-        f"and colour tone. Let what you SEE directly inform your decisions — "
-        f"especially caption colour (pick contrast against real background) "
-        f"and b-roll prompts (make them visually complement the actual scene)."
+        "Use them to understand the scene, speaker energy, setting, and colour tone. "
+        "Let what you SEE directly inform your decisions — especially caption colour "
+        "(pick contrast against real background), b-roll prompts, and zoom moments "
+        "(zoom in when the speaker makes a strong point or reacts visibly)."
         if has_vision else
         "No frames available — base all decisions on transcript only."
     )
@@ -189,6 +240,15 @@ Return ONLY a valid JSON object — no markdown fences, no explanation, nothing 
   "energy_map": [
     {{"time": 0.0, "energy": "low|high|peak"}}
   ],
+  "zoom_cuts": [
+    {{
+      "time": 3.5,
+      "zoom": 1.06,
+      "duration": 1.2
+    }}
+  ],
+  "emphasis_word_indices": [4, 17, 31],
+  "emoji_map": {{"4": "⚡", "31": "🔥"}},
   "suggested_trim": {{
     "start": 0.0,
     "end": {duration:.1f},
@@ -196,7 +256,44 @@ Return ONLY a valid JSON object — no markdown fences, no explanation, nothing 
   }}
 }}
 
-Rules:
+emphasis_word_indices rules:
+- These are indices into the word list (0-based). Word 0 = first word in transcript.
+- An emphasis word is shown ALONE in its own large caption pill — no other words around it.
+- Use this for: key technical terms, the ONE word that carries the whole sentence's meaning,
+  dramatic single words ("NEVER", "FREE", "WRONG"), words the speaker stresses audibly.
+- NEVER pick filler words (hai, toh, kya, aur, the, a, is, it).
+- SPARSITY IS CRITICAL: pick at most 1 emphasis word per 8–10 words of transcript.
+  For a 40-word transcript: max 4–5 emphasis words. For 80 words: max 8.
+- Do not pick consecutive word indices — spread them out.
+
+emoji_map rules:
+- Place 1–3 emojis total across the ENTIRE video. More = cluttered.
+- Use only when the emoji genuinely adds meaning or humor to that exact word/moment.
+- The emoji appears appended to that word's caption segment.
+- Good uses: 🔥 on "amazing", ⚡ on "fast", ⏱️ on "time", 💡 on "idea", ❌ on "wrong"
+- Bad uses: random emojis on every caption, emojis that don't relate to the word
+- Key: emoji_map keys are STRINGS of the word index (JSON requirement).
+
+zoom_cuts rules — read carefully:
+- Pick moments where a zoom IN makes the video more engaging:
+    * Speaker says something surprising, punchy, or emotionally charged
+    * A reaction beat — a pause, a smirk, a head shake
+    * A key word or phrase the viewer needs to feel, not just hear
+    * Right after a cut point (gives the new segment energy)
+- zoom value: 1.0 = no zoom (normal). Max is 1.08. Recommended: 1.04–1.07.
+    * 1.03–1.04 = subtle pull-in (calm/educational content)
+    * 1.05–1.06 = visible punch-in (energetic/motivational)
+    * 1.07–1.08 = strong punch (peak moments only, use sparingly)
+- duration: how long the zoom-in holds before easing back to 1.0 (0.5–3.0 s).
+    * Short duration (0.5–1.0 s): snap zoom — punchy, exciting
+    * Long duration (2.0–3.0 s): slow push — builds tension or intimacy
+- Do NOT place zoom_cuts during b-roll inserts (those are separate clips).
+- Spread zoom_cuts across the video — at least 1.5 s gap between any two.
+- Target 4–7 zoom cuts for a typical Short. More is not better.
+- zoom = 1.0 entries are valid and mean "ease back to normal" — use them
+  after a punch-in if you want explicit control of the return timing.
+
+Other rules:
 - scene_description + visual_style MUST reference what you actually see in the images
 - caption_color: look at the actual background and pick a contrasting colour
 - b-roll prompts: highly specific to content topic, NOT generic stock descriptions
@@ -205,37 +302,60 @@ Rules:
 - if video under 60s keep full duration in suggested_trim; if longer find the best 45-55s window
 """
 
-    message = {
-        "role": "user",
-        "content": prompt
-    }
-    # Prevent 500 Server Error by skipping multimodal images for text-only Gemma
-    # if frames_b64:
-    #     message["images"] = frames_b64
+    message = {"role": "user", "content": prompt}
+    # images are attached if vision is available
+    if frames_b64:
+        message["images"] = frames_b64
 
     payload = {
         "model":  GEMMA_MODEL,
         "stream": False,
         "messages": [message],
-        "options": {"temperature": 0.25, "num_ctx": 8192, "top_p": 0.9},
+        "options": {"temperature": 0.25, "num_ctx": 4096, "top_p": 0.9},
     }
 
     log.info(f"[gemma] Querying {GEMMA_MODEL} "
              f"({'multimodal: ' + str(len(frames_b64)) + ' frames' if has_vision else 'text-only'})...")
 
     try:
-        resp = requests.post(OLLAMA_URL, json=payload, timeout=180)
+        resp = requests.post(OLLAMA_URL, json=payload, timeout=360)
         resp.raise_for_status()
 
         raw  = resp.json()["message"]["content"].strip()
         data = _extract_json(raw)
 
-        trim = data.get("suggested_trim", {"start": 0, "end": duration})
+        trim      = data.get("suggested_trim", {"start": 0, "end": duration})
+        raw_zooms = data.get("zoom_cuts", [])
+        zoom_cuts = _validate_zoom_cuts(raw_zooms, duration)
+
+        # Parse emphasis word indices — validate they are ints in range
+        raw_emphasis = data.get("emphasis_word_indices", [])
+        n_words      = len(transcript_words)
+        emphasis_word_indices = sorted(set(
+            int(i) for i in raw_emphasis
+            if str(i).lstrip("-").isdigit() and 0 <= int(i) < n_words
+        ))
+
+        # Parse emoji_map — keys are string word indices
+        raw_emoji = data.get("emoji_map", {})
+        emoji_map = {}
+        for k, v in raw_emoji.items():
+            try:
+                wi = int(k)
+                if 0 <= wi < n_words and isinstance(v, str) and len(v) <= 4:
+                    emoji_map[wi] = v
+            except (ValueError, TypeError):
+                pass
+        # Cap at 3 emojis
+        if len(emoji_map) > 3:
+            emoji_map = dict(list(emoji_map.items())[:3])
 
         log.info(f"[gemma] Style={data.get('style')} | Hook={data.get('hook')}")
         log.info(f"[gemma] Scene: {data.get('scene_description','')[:80]}")
-        log.info(f"[gemma] Visual: {data.get('visual_style','')[:60]}")
+        log.info(f"[gemma] Emphasis indices ({len(emphasis_word_indices)}): {emphasis_word_indices[:10]}")
+        log.info(f"[gemma] Emoji map: {emoji_map}")
         log.info(f"[gemma] Cuts: {data.get('cut_points',[])} | B-roll: {len(data.get('broll_prompts',[]))}")
+        log.info(f"[gemma] Zoom cuts ({len(zoom_cuts)}): {zoom_cuts}")
 
         return EditDecision(
             style             = data.get("style", "energetic"),
@@ -248,8 +368,21 @@ Rules:
             suggested_trim    = {"start": trim.get("start", 0), "end": trim.get("end", duration)},
             scene_description = data.get("scene_description", ""),
             visual_style      = data.get("visual_style", ""),
+            zoom_cuts         = zoom_cuts,
         )
 
+    except requests.Timeout:
+        log.warning(f"[gemma] Timeout after 360s (likely due to high GPU load or insufficient VRAM). "
+                   f"Try: 1) Close other GPU apps, 2) Use gemma3:4b with text-only (no images), "
+                   f"3) Reduce N_KEYFRAMES to 3 or 4")
+        return EditDecision(
+            style="energetic", hook="You need to see this!",
+            caption_color="#FFFF00", caption_font="bold",
+            cut_points=[], broll_prompts=[], energy_map=[],
+            suggested_trim={"start": 0, "end": duration},
+            scene_description="", visual_style="",
+            zoom_cuts=[],
+        )
     except Exception as e:
         log.warning(f"[gemma] Failed: {e} — using safe defaults")
         return EditDecision(
@@ -258,4 +391,5 @@ Rules:
             cut_points=[], broll_prompts=[], energy_map=[],
             suggested_trim={"start": 0, "end": duration},
             scene_description="", visual_style="",
+            zoom_cuts=[],
         )
