@@ -24,9 +24,11 @@ log = logging.getLogger(__name__)
 _device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def _run(cmd: list[str], label: str):
+def _run(cmd: list[str], label: str, cwd: str = None):
+    # Ensure all command elements are strings
+    cmd = [str(c) for c in cmd]
     log.info(f"[ffmpeg:{label}] " + " ".join(cmd[:6]) + " ...")
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
     if result.returncode != 0:
         log.error(f"[ffmpeg:{label}] FAILED:\n{result.stderr[-3000:]}")
         raise RuntimeError(f"FFmpeg {label} failed")
@@ -34,16 +36,35 @@ def _run(cmd: list[str], label: str):
 
 
 def _probe(video_path: str) -> tuple[int, int, float]:
-    """Returns (width, height, duration)"""
+    """Returns (width, height, duration) — uses video stream duration to avoid audio/video mismatch"""
     cmd = ["ffprobe","-v","quiet","-print_format","json","-show_streams","-show_format", video_path]
     data = json.loads(subprocess.check_output(cmd))
     w, h, dur = 1920, 1080, 0.0
+    
+    # Get video stream duration (most reliable for videos with mismatched audio/video)
     for s in data.get("streams", []):
         if s.get("codec_type") == "video":
             w   = int(s.get("width", 1920))
             h   = int(s.get("height", 1080))
-            dur = float(s.get("duration", data["format"].get("duration", 0)))
+            # Prefer video stream duration, fallback to format duration
+            if "duration" in s:
+                dur = float(s["duration"])
+            else:
+                dur = float(data["format"].get("duration", 0))
+            log.info(f"[probe] Video stream duration: {dur:.2f}s (h={h}x{w})")
             break
+    
+    # Check for audio/video duration mismatch
+    audio_dur = 0.0
+    for s in data.get("streams", []):
+        if s.get("codec_type") == "audio" and "duration" in s:
+            audio_dur = float(s["duration"])
+            break
+    
+    if audio_dur > 0 and abs(audio_dur - dur) > 0.5:
+        log.warning(f"[probe] Audio/video duration mismatch! Video={dur:.2f}s, Audio={audio_dur:.2f}s")
+        log.warning(f"[probe] Will use video duration {dur:.2f}s and trim audio to match")
+    
     return w, h, dur
 
 
@@ -106,7 +127,24 @@ def run_pipeline(input_path: str, output_path: str, user_prefs: dict = None) -> 
     # ── 3. Face tracking ─────────────────────────────────────────────────────
     log.info("[pipeline] Step 3: Face tracking")
     crop_path, fps, src_w, src_h = get_face_crop_path(input_path, 1080, 1920)
-    crop_script = export_crop_filter(crop_path, fps, src_w, src_h)
+    # Write crop script to work dir for shorter path (avoids Windows command line length limits)
+    crop_script = export_crop_filter(crop_path, fps, src_w, src_h, script_path=str(work / "crop_cmds.txt"))
+    
+    # ── 3.5. Audio/Video sync (fix Telegram trim issues) ──────────────────────
+    # If audio is longer than video (e.g., Telegram trimmed video but not audio),
+    # trim the audio to match video duration
+    synced_video = str(work / "synced.mp4")
+    log.info(f"[pipeline] Syncing audio to video duration ({duration:.2f}s)")
+    _run([
+        "ffmpeg", "-y",
+        "-i", input_path,  # Use original input, not crop_path (which is keyframe data)
+        "-t", str(duration),  # Convert to string explicitly
+        "-c:v", "copy",
+        "-c:a", "aac", "-b:a", "192k",
+        "-shortest",
+        synced_video
+    ], "audio_sync")
+    input_path = synced_video  # Use synced video from now on
 
     # ── 4. B-roll image generation ───────────────────────────────────────────
     log.info("[pipeline] Step 4: B-roll generation")
@@ -125,12 +163,14 @@ def run_pipeline(input_path: str, output_path: str, user_prefs: dict = None) -> 
     emphasis_indices = set(getattr(decision, "emphasis_word_indices", []))
     emoji_map        = getattr(decision, "emoji_map", {})
 
+    caption_position = getattr(decision, "caption_position", "bottom")
     ass_content = build_ass(
         words, c_color, c_font, c_size, c_border,
         emphasis_indices = emphasis_indices,
         emoji_map        = emoji_map,
         c_animation      = c_animation,
         c_style          = c_style,
+       # caption_position = caption_position,
         video_w=1080, video_h=1920,
     )
     ass_path = str(work / "captions.ass")
@@ -151,21 +191,27 @@ def run_pipeline(input_path: str, output_path: str, user_prefs: dict = None) -> 
     # ── 7. Face-tracked dynamic crop + resize to 9:16 ───────────────────────
     cropped = str(work / "cropped.mp4")
     log.info("[pipeline] Step 7: Dynamic face-tracking crop + resize")
-    script_esc = crop_script.replace("\\", "/").replace(":", "\\:")
-    vf_crop = f"sendcmd=f='{script_esc}',crop='iw:ih:0:0',scale=1080:1920:flags=lanczos"
-    
+
+    # FFmpeg's filtergraph parser processes escape sequences BEFORE passing the
+    # value to sendcmd, so there is no escaping that survives a Windows drive
+    # letter ("D\:/path" → FFmpeg sees option-name "D", value empty).
+    # The only robust fix: use a plain filename (no path) and run FFmpeg with
+    # cwd=work so it resolves the script without any drive-letter colon.
+    crop_script_name = Path(crop_script).name   # e.g. "crop_cmds.txt"
+    vf_crop = f"sendcmd=f={crop_script_name},crop=iw:ih:0:0,scale=1080:1920:flags=lanczos"
+
     ffmpeg_crop_cmd = ["ffmpeg", "-y"]
     if _device == "cuda":
         ffmpeg_crop_cmd.extend(["-hwaccel", "cuda"])
     ffmpeg_crop_cmd.extend(["-i", trimmed, "-vf", vf_crop])
-    
+
     if _device == "cuda":
         ffmpeg_crop_cmd.extend(["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "22"])
     else:
         ffmpeg_crop_cmd.extend(["-c:v", "libx264", "-crf", "22"])
     ffmpeg_crop_cmd.extend(["-c:a", "copy", cropped])
-    
-    _run(ffmpeg_crop_cmd, "dynamic_crop")
+
+    _run(ffmpeg_crop_cmd, "dynamic_crop", cwd=str(work))
 
     # ── 8. Apply effects + captions (main pass) ──────────────────────────────
     log.info("[pipeline] Step 8: Effects + captions (zoom + captions)")

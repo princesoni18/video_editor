@@ -120,8 +120,17 @@ async def handle_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("Send me a video file and I'll turn it into a Short!")
         return
 
+    if getattr(video, "file_size", 0) and video.file_size > 20 * 1024 * 1024:
+        await msg.reply_text("Too big! Telegram bots can only download files up to 20MB.")
+        return
+
     # Download
-    file = await ctx.bot.get_file(video.file_id)
+    try:
+        file = await ctx.bot.get_file(video.file_id)
+    except Exception as e:
+        await msg.reply_text(f"Could not download video: {e}")
+        return
+
     suffix = Path(video.file_name).suffix if hasattr(video, "file_name") and video.file_name else ".mp4"
     input_path = WORK_DIR / f"{video.file_id}{suffix}"
     await file.download_to_drive(str(input_path))

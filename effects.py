@@ -75,9 +75,15 @@ def _segment_words(words: list[dict], emphasis_indices: set) -> list[dict]:
         "emoji": None   # filled downstream
     }
     """
+    import logging
+    log = logging.getLogger(__name__)
+    
     WORDS_PER_GROUP = 3
     segments = []
     buf = []
+    
+    # DEBUG: Log input
+    log.debug(f"[_segment_words] Processing {len(words)} words with emphasis_indices={sorted(emphasis_indices)}")
 
     def flush_buf():
         if buf:
@@ -93,11 +99,20 @@ def _segment_words(words: list[dict], emphasis_indices: set) -> list[dict]:
     for i, w in enumerate(words):
         if i in emphasis_indices:
             flush_buf()
+            # Hold emphasis pill on screen long enough to read.
+            # Quick words (< 0.9s) get extended; never bleeds into next word.
+            MIN_EMPH_HOLD = 0.90
+            emph_end = w["end"]
+            if (emph_end - w["start"]) < MIN_EMPH_HOLD:
+                extended = w["start"] + MIN_EMPH_HOLD
+                if i + 1 < len(words):
+                    extended = min(extended, words[i + 1]["start"] - 0.04)
+                emph_end = max(w["end"], extended)
             segments.append({
                 "type":  "emphasis",
                 "words": [w],
                 "start": w["start"],
-                "end":   w["end"],
+                "end":   emph_end,
                 "emoji": None,
             })
         else:
@@ -137,6 +152,14 @@ def build_ass(words:            list[dict],
         emphasis_indices = set()
     if emoji_map is None:
         emoji_map = {}
+    
+    # DEBUG: Log what we received
+    import logging
+    log = logging.getLogger(__name__)
+    log.info(f"[build_ass] Received {len(words)} words, emphasis_indices={sorted(emphasis_indices)}")
+    if emphasis_indices:
+        emph_words = [(i, words[i]["word"]) for i in sorted(emphasis_indices) if i < len(words)]
+        log.info(f"[build_ass] Emphasis words: {emph_words}")
 
     font      = FONT_MAP.get(c_font, c_font)
     base_size = SIZE_MAP.get(c_size, 58)
@@ -164,6 +187,15 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
 
     segments = _segment_words(words, emphasis_indices)
+    
+    # DEBUG: Log segments created
+    log.info(f"[build_ass] Created {len(segments)} segments")
+    emphasis_segs = [i for i, seg in enumerate(segments) if seg["type"] == "emphasis"]
+    if emphasis_segs:
+        log.info(f"[build_ass] Emphasis segments at indices: {emphasis_segs}")
+        for idx in emphasis_segs:
+            seg = segments[idx]
+            log.info(f"  - Segment {idx}: words={[w['word'] for w in seg['words']]}, time={seg['start']:.2f}-{seg['end']:.2f}")
 
     # Build reverse lookup: word index → segment index
     # We need to match words by their position in the original word list
@@ -186,10 +218,15 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         style = "Emph" if seg["type"] == "emphasis" else "Normal"
         if seg["emoji"]:
             txt = f"{txt} {seg['emoji']}"
-        events.append(
+        event = (
             f"Dialogue: 0,{_ass_time(seg['start'])},{_ass_time(seg['end'])},"
             f"{style},,0,0,0,,{txt}"
         )
+        events.append(event)
+        if style == "Emph":
+            log.info(f"[build_ass] Emphasis event: [{seg['start']:.2f}-{seg['end']:.2f}] {txt}")
+    
+    log.info(f"[build_ass] Generated {len(events)} caption events ({len([e for e in events if 'Emph' in e])} emphasis)")
 
     return header + "\n".join(events) + "\n"
 

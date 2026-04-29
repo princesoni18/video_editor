@@ -32,33 +32,42 @@ def get_face_crop_path(video_path: str, target_w: int = 1080, target_h: int = 19
         min_detection_confidence=0.6
     )
 
-    # ── Physics parameters ────────────────────────────────────────────────────
-    stiffness = 0.07   # how eagerly camera chases target (lower = lazier)
-    damping   = 0.82   # how quickly velocity bleeds off (higher = less overshoot)
-    max_speed = 18     # px/frame speed cap
+    # ── EMA camera tracker ────────────────────────────────────────────────────
+    # Pure exponential moving average — mathematically cannot overshoot or
+    # oscillate, eliminating the spring-physics jitter from the old approach.
+    #
+    # Two alpha values:
+    #   ALPHA_FAST  — used for first ~2s after detection while camera locks on.
+    #                 Slightly more responsive so initial framing isn't sluggish.
+    #   ALPHA_SLOW  — used once camera is settled; very lazy, only moves when
+    #                 face actually drifts, ignoring micro-head-bobs.
+    ALPHA_FAST    = 0.10    # ~2.5s settle, max 10px/frame
+    ALPHA_SLOW    = 0.06    # ~4s settle, max 6px/frame — almost imperceptible
 
-    # EMA pre-filter on raw detections (lower alpha = heavier smoothing)
-    ema_alpha = 0.20
-    ema_cx    = None   # initialised on first detection — no cold-start slam
-    ema_cy    = None
+    # Headroom EMA: updated independently so vertical drift stays smooth
+    ALPHA_HEADROOM = 0.08
 
-    # Separate slow EMA for headroom so it doesn't drag the y target around
-    ema_headroom       = None
-    ema_headroom_alpha = 0.10
+    # Dead zone: don't move camera for tiny face shifts inside this radius.
+    # 25px on the face-tracked crop (which is ~85% of the 9:16 inscribed rect).
+    # This absorbs nodding and micro-movement without camera drift.
+    DEAD_ZONE = 25          # px — was 45 (too large → visible lurches)
 
-    dead_zone = 45     # px — ignore micro-movements inside this radius
+    # Warm-up period: use ALPHA_FAST for this many frames after first detection
+    WARMUP_FRAMES = int(fps * 2.0)  # 2 seconds
 
-    # Camera state — ALL FLOATS, never cast to int inside the loop
-    smooth_x = float(src_w // 2)
-    smooth_y = float(src_h // 2)
-    vel_x    = 0.0
-    vel_y    = 0.0
-    target_x = smooth_x
-    target_y = smooth_y
+    ema_cx       = None
+    ema_cy       = None
+    ema_headroom = None
+    target_x     = None
+    target_y     = None
 
-    first_detection_done = False
+    # Camera position — EMA directly on position, no velocity state needed
+    cam_x = None
+    cam_y = None
+    frames_since_detection = 0
+    first_detection_done   = False
 
-    raw_path  = []   # x/y stored as floats throughout
+    raw_path  = []
     frame_idx = 0
 
     while True:
@@ -78,7 +87,6 @@ def get_face_crop_path(video_path: str, target_w: int = 1080, target_h: int = 19
             )
             bbox = det.location_data.relative_bounding_box
 
-            # Keep as floats — no int() cast here
             bx = bbox.xmin   * src_w
             by = bbox.ymin   * src_h
             bw = bbox.width  * src_w
@@ -89,50 +97,49 @@ def get_face_crop_path(video_path: str, target_w: int = 1080, target_h: int = 19
             face_h_px   = bh
 
         if detected_cx is not None:
-            # On the very first detection, snap everything to the face position
-            # so the camera doesn't slam in from the frame centre
             if not first_detection_done:
-                ema_cx           = detected_cx
-                ema_cy           = detected_cy
-                ema_headroom     = face_h_px * 0.55
-                target_x         = ema_cx
-                target_y         = ema_cy - ema_headroom
-                smooth_x         = target_x
-                smooth_y         = target_y
-                first_detection_done = True
+                # First detection: initialise everything at face position.
+                # Camera snaps here but we post-smooth the whole path later,
+                # so the snap becomes a fast ramp instead of an instant jump.
+                ema_cx       = detected_cx
+                ema_cy       = detected_cy
+                ema_headroom = face_h_px * 0.55
+                target_x     = ema_cx
+                target_y     = ema_cy - ema_headroom
+                cam_x        = target_x
+                cam_y        = target_y
+                first_detection_done   = True
+                frames_since_detection = 0
+            else:
+                frames_since_detection += 1
 
-            # EMA pre-filter on position
-            ema_cx = ema_alpha * detected_cx + (1 - ema_alpha) * ema_cx
-            ema_cy = ema_alpha * detected_cy + (1 - ema_alpha) * ema_cy
+                # EMA pre-filter on raw detection (smooths MediaPipe noise)
+                ema_cx = 0.18 * detected_cx + 0.82 * ema_cx
+                ema_cy = 0.18 * detected_cy + 0.82 * ema_cy
 
-            # Smooth headroom independently — apply to EMA cy, not smooth_y,
-            # so it isn't double-filtered and doesn't cause vertical drift
-            raw_headroom = face_h_px * 0.55
-            ema_headroom = ema_headroom_alpha * raw_headroom + (1 - ema_headroom_alpha) * ema_headroom
-            proposed_cy  = ema_cy - ema_headroom
+                raw_headroom = face_h_px * 0.55
+                ema_headroom = ALPHA_HEADROOM * raw_headroom + (1 - ALPHA_HEADROOM) * ema_headroom
+                proposed_y   = ema_cy - ema_headroom
 
-            # Dead zone — only move spring target when face moves meaningfully
-            if abs(ema_cx    - target_x) > dead_zone:
-                target_x = ema_cx
-            if abs(proposed_cy - target_y) > dead_zone:
-                target_y = proposed_cy
+                # Dead zone: only advance spring target when face moves meaningfully
+                if abs(ema_cx   - target_x) > DEAD_ZONE:
+                    target_x = ema_cx
+                if abs(proposed_y - target_y) > DEAD_ZONE:
+                    target_y = proposed_y
 
-        # ── Velocity-based spring physics ─────────────────────────────────────
-        force_x = (target_x - smooth_x) * stiffness
-        force_y = (target_y - smooth_y) * stiffness
+        if cam_x is None:
+            # No face detected yet — park camera at frame centre
+            cam_x = float(src_w // 2)
+            cam_y = float(src_h // 2)
+        else:
+            # EMA camera movement: fast during warm-up, slow once settled
+            alpha = ALPHA_FAST if frames_since_detection < WARMUP_FRAMES else ALPHA_SLOW
+            cam_x = alpha * target_x + (1.0 - alpha) * cam_x
+            cam_y = alpha * target_y + (1.0 - alpha) * cam_y
 
-        vel_x = vel_x * damping + force_x
-        vel_y = vel_y * damping + force_y
-
-        vel_x = max(-max_speed, min(max_speed, vel_x))
-        vel_y = max(-max_speed, min(max_speed, vel_y))
-
-        smooth_x += vel_x
-        smooth_y += vel_y
-
-        # Clamp crop box — stay in floats, never round here
-        fx = smooth_x - crop_w / 2
-        fy = smooth_y - crop_h / 2
+        # Clamp crop box to valid frame boundaries
+        fx = cam_x - crop_w / 2
+        fy = cam_y - crop_h / 2
         fx = max(0.0, min(fx, float(src_w - crop_w)))
         fy = max(0.0, min(fy, float(src_h - crop_h)))
 
@@ -141,18 +148,16 @@ def get_face_crop_path(video_path: str, target_w: int = 1080, target_h: int = 19
 
     cap.release()
 
-    # ── Gaussian temporal smoothing over float positions ──────────────────────
-    crop_path = _smooth_path(raw_path, fps, sigma_sec=0.40)
+    # ── Gaussian temporal smoothing (second pass) ─────────────────────────────
+    # sigma_sec=0.70 (was 0.40) — wider kernel absorbs any remaining micro-jitter
+    # and makes the path feel like a professional camera operator.
+    crop_path = _smooth_path(raw_path, fps, sigma_sec=0.70)
 
     return crop_path, fps, src_w, src_h
 
 
-def _smooth_path(raw_path: list[dict], fps: float, sigma_sec: float = 0.40) -> list[dict]:
-    """Gaussian-weighted rolling average over x/y.
-
-    Operates entirely in floats — rounding is deferred to export_crop_filter
-    so quantisation noise never enters the path data.
-    """
+def _smooth_path(raw_path: list[dict], fps: float, sigma_sec: float = 0.70) -> list[dict]:
+    """Gaussian-weighted rolling average over x/y.  Operates in floats throughout."""
     if not raw_path:
         return raw_path
 
@@ -168,12 +173,10 @@ def _smooth_path(raw_path: list[dict], fps: float, sigma_sec: float = 0.40) -> l
     xs_s = np.convolve(xs, kernel, mode="same")
     ys_s = np.convolve(ys, kernel, mode="same")
 
-    # Re-normalise edges (zero-padding in convolve biases the first/last frames)
     norm  = np.convolve(np.ones(len(raw_path)), kernel, mode="same")
     xs_s /= norm
     ys_s /= norm
 
-    # Return floats — no rounding here
     return [
         {"frame": kf["frame"], "x": float(xs_s[i]), "y": float(ys_s[i]),
          "w": kf["w"], "h": kf["h"]}
@@ -183,13 +186,13 @@ def _smooth_path(raw_path: list[dict], fps: float, sigma_sec: float = 0.40) -> l
 
 def export_crop_filter(crop_path, fps, src_w, src_h,
                        target_w=1080, target_h=1920,
-                       min_keyframe_dist: float = 0.5):
-    """Write a crop keyframe script.
-
-    x/y in crop_path are floats — rounded only here, once, at output time.
-    min_keyframe_dist lowered to 0.5px: the path is already smooth so we
-    want dense keyframes for the editor to interpolate, not sparse ones that
-    create long linear segments.
+                       min_keyframe_dist: float = 0.5,
+                       script_path: str = None):
+    """Write crop keyframe script.  Rounds x/y only here, at output time.
+    
+    Args:
+        script_path: Optional custom path for script file. If not provided,
+                    uses temp directory (which can cause command line length issues on Windows).
     """
     lines  = []
     prev_x = prev_y = None
@@ -212,7 +215,9 @@ def export_crop_filter(crop_path, fps, src_w, src_h,
 
         prev_x, prev_y = x, y
 
-    script_path = os.path.join(tempfile.gettempdir(), "crop_script.txt")
+    if script_path is None:
+        script_path = os.path.join(tempfile.gettempdir(), "crop_script.txt")
+    
     with open(script_path, "w") as f:
         f.write("\n".join(lines))
 

@@ -1,12 +1,12 @@
 """
-gemma_brain.py — Gemma 3:4B via Ollama (multimodal)
+gemma_brain.py — Gemma 3:4B or Gemma 4:E4B via Ollama (multimodal)
 Sends video keyframes + transcript → smart editing decisions as JSON
 
-Gemma 3:4B is a lightweight multimodal model:
-  - 4B parameters, ~3GB VRAM cost
-  - Multimodal: reads images + text together
-  - 128K context window
-  - Pull command: ollama pull gemma3:4b
+Dual-model support:
+  - Gemma 3:4B (default): 4B parameters, ~3GB VRAM, faster (6144 context)
+  - Gemma 4:E4B: 8B parameters, ~9GB VRAM, stronger (8192 context)
+  
+Set USE_GEMMA4 boolean to switch models at the top of this file.
 """
 
 import json, re, base64, logging, cv2
@@ -18,8 +18,21 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
-OLLAMA_URL  = "http://localhost:11434/api/chat"
-GEMMA_MODEL = "gemma3:4b"
+OLLAMA_URL = "http://localhost:11434/api/chat"
+
+# ── MODEL CONFIGURATION ─────────────────────────────────────
+# Set USE_GEMMA4 = True to use gemma4:e4b (stronger, ~9GB, needs 8192+ context)
+# Set USE_GEMMA4 = False to use gemma3:4b (faster, ~3GB, needs 6144 context)
+USE_GEMMA4 = False
+
+if USE_GEMMA4:
+    GEMMA_MODEL = "gemma4:e4b"
+    MODEL_CONTEXT = 8192
+    MODEL_TIMEOUT = 300    # gemma4 is faster
+else:
+    GEMMA_MODEL = "gemma3:4b"
+    MODEL_CONTEXT = 6144
+    MODEL_TIMEOUT = 360    # gemma3:4b needs more time
 
 # How many keyframes to sample from the video and send to Gemma
 # More = smarter decisions, slower inference. 6 is a good balance.
@@ -257,14 +270,29 @@ Return ONLY a valid JSON object — no markdown fences, no explanation, nothing 
 }}
 
 emphasis_word_indices rules:
-- These are indices into the word list (0-based). Word 0 = first word in transcript.
-- An emphasis word is shown ALONE in its own large caption pill — no other words around it.
-- Use this for: key technical terms, the ONE word that carries the whole sentence's meaning,
-  dramatic single words ("NEVER", "FREE", "WRONG"), words the speaker stresses audibly.
-- NEVER pick filler words (hai, toh, kya, aur, the, a, is, it).
-- SPARSITY IS CRITICAL: pick at most 1 emphasis word per 8–10 words of transcript.
-  For a 40-word transcript: max 4–5 emphasis words. For 80 words: max 8.
-- Do not pick consecutive word indices — spread them out.
+- These are 0-based indices into the word list (word 0 = first word of transcript).
+- An emphasis word is shown ALONE as a BIG SOLO caption pill — nothing else on screen.
+- It creates a "SMASH CUT to single word" effect. Use it like a highlight reel moment.
+
+WHAT TO PICK — only these types:
+  * NOUNS that are the core topic: "AI", "pipeline", "agent", "schedule", "GPU", "deadline"
+  * TECHNICAL TERMS the speaker is explaining: pick the term itself, not words around it
+  * STRONG ADJECTIVES/VERBS with impact: "FREE", "WRONG", "FASTER", "BROKEN", "CRASHED"
+  * Numbers/stats that shock: "100x", "ZERO", "1ms"
+  * A word the speaker clearly stresses or pauses before/after (audible emphasis)
+
+ABSOLUTE NEVER PICK (hard blacklist — English AND Hinglish fillers):
+  English:  the, a, an, is, it, in, on, at, to, of, and, or, but, so, then, this, that, with, you, we, I
+  Hinglish: toh, hai, kya, aur, bhi, yeh, ye, ek, jo, jisse, jab, ka, ki, ke, ko, na, hi, hoga, hota, tha, the, woh, wo, se, me, mein, ab, bas
+
+SPARSITY IS CRITICAL — these are rare moments, but mark genuine highlights:
+  - Pick approximately 1 emphasis word per 8–10 words of transcript (be more selective than usual)
+  - For a 30-word transcript: 2–3 emphasis words is good
+  - For 60 words: 4–6 emphasis words
+  - For 90 words: 7–9 emphasis words
+  - Never pick two consecutive word indices
+  - Spread them evenly across the video — not all clustered at start or end
+  - Prefer real semantic importance over perfect sparsity. Strong keywords beat perfect ratios.
 
 emoji_map rules:
 - Place 1–3 emojis total across the ENTIRE video. More = cluttered.
@@ -311,14 +339,14 @@ Other rules:
         "model":  GEMMA_MODEL,
         "stream": False,
         "messages": [message],
-        "options": {"temperature": 0.25, "num_ctx": 4096, "top_p": 0.9},
+        "options": {"temperature": 0.25, "num_ctx": MODEL_CONTEXT, "top_p": 0.9},
     }
 
     log.info(f"[gemma] Querying {GEMMA_MODEL} "
              f"({'multimodal: ' + str(len(frames_b64)) + ' frames' if has_vision else 'text-only'})...")
 
     try:
-        resp = requests.post(OLLAMA_URL, json=payload, timeout=360)
+        resp = requests.post(OLLAMA_URL, json=payload, timeout=MODEL_TIMEOUT)
         resp.raise_for_status()
 
         raw  = resp.json()["message"]["content"].strip()
@@ -369,10 +397,12 @@ Other rules:
             scene_description = data.get("scene_description", ""),
             visual_style      = data.get("visual_style", ""),
             zoom_cuts         = zoom_cuts,
+            emphasis_word_indices = emphasis_word_indices,
+            emoji_map         = emoji_map,
         )
 
     except requests.Timeout:
-        log.warning(f"[gemma] Timeout after 360s (likely due to high GPU load or insufficient VRAM). "
+        log.warning(f"[gemma] Timeout after {MODEL_TIMEOUT}s (likely due to high GPU load or insufficient VRAM). "
                    f"Try: 1) Close other GPU apps, 2) Use gemma3:4b with text-only (no images), "
                    f"3) Reduce N_KEYFRAMES to 3 or 4")
         return EditDecision(
@@ -382,6 +412,8 @@ Other rules:
             suggested_trim={"start": 0, "end": duration},
             scene_description="", visual_style="",
             zoom_cuts=[],
+            emphasis_word_indices=[],
+            emoji_map={},
         )
     except Exception as e:
         log.warning(f"[gemma] Failed: {e} — using safe defaults")
@@ -392,4 +424,6 @@ Other rules:
             suggested_trim={"start": 0, "end": duration},
             scene_description="", visual_style="",
             zoom_cuts=[],
+            emphasis_word_indices=[],
+            emoji_map={},
         )
