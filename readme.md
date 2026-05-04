@@ -1,10 +1,5 @@
-
-
-
-https://github.com/user-attachments/assets/988b32ab-f363-4129-8824-15462c81cf0e https://github.com/user-attachments/assets/47ccfc62-3892-40a4-b402-ad03f4f79af1
-
-
-
+#DEMO
+https://www.notion.so/AI-Video-editor-Demo-351f4cbca78a80e0adfcffd28af126f1?source=copy_link
 
 # 🎬 Smart AI Shorts Bot (Automated Video Editing Pipeline)
 
