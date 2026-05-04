@@ -1,3 +1,11 @@
+
+
+
+https://github.com/user-attachments/assets/988b32ab-f363-4129-8824-15462c81cf0e https://github.com/user-attachments/assets/47ccfc62-3892-40a4-b402-ad03f4f79af1
+
+
+
+
 # 🎬 Smart AI Shorts Bot (Automated Video Editing Pipeline)
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
