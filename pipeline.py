@@ -35,17 +35,32 @@ def _run(cmd: list[str], label: str, cwd: str = None):
     log.info(f"[ffmpeg:{label}] Done.")
 
 
-def _probe(video_path: str) -> tuple[int, int, float]:
-    """Returns (width, height, duration) — uses video stream duration to avoid audio/video mismatch"""
+def _probe(video_path: str) -> tuple[int, int, float, float]:
+    """Returns (width, height, duration, fps) — uses video stream duration to avoid audio/video mismatch"""
     cmd = ["ffprobe","-v","quiet","-print_format","json","-show_streams","-show_format", video_path]
     data = json.loads(subprocess.check_output(cmd))
     w, h, dur = 1920, 1080, 0.0
+    fps = 30.0
     
     # Get video stream duration (most reliable for videos with mismatched audio/video)
     for s in data.get("streams", []):
         if s.get("codec_type") == "video":
             w   = int(s.get("width", 1920))
             h   = int(s.get("height", 1080))
+            
+            # FPS detection
+            avg_frame_rate = s.get("avg_frame_rate", "0/1")
+            r_frame_rate = s.get("r_frame_rate", "0/1")
+            try:
+                num, den = map(int, avg_frame_rate.split("/"))
+                if den != 0:
+                    fps = num / den
+            except:
+                pass
+                
+            is_vfr = avg_frame_rate != r_frame_rate
+            log.info(f"[probe] FPS: {fps:.2f}, VFR Detected: {is_vfr}")
+
             # Prefer video stream duration, fallback to format duration
             if "duration" in s:
                 dur = float(s["duration"])
@@ -65,7 +80,7 @@ def _probe(video_path: str) -> tuple[int, int, float]:
         log.warning(f"[probe] Audio/video duration mismatch! Video={dur:.2f}s, Audio={audio_dur:.2f}s")
         log.warning(f"[probe] Will use video duration {dur:.2f}s and trim audio to match")
     
-    return w, h, dur
+    return w, h, dur, fps
 
 
 def run_pipeline(input_path: str, output_path: str, user_prefs: dict = None) -> dict:
@@ -73,9 +88,24 @@ def run_pipeline(input_path: str, output_path: str, user_prefs: dict = None) -> 
     work = Path(tempfile.mkdtemp(prefix="shorts_"))
     log.info(f"[pipeline] Work dir: {work}")
 
-    src_w, src_h, duration = _probe(input_path)
+    src_w, src_h, duration, fps = _probe(input_path)
     already_vertical = src_h > src_w
     log.info(f"[pipeline] Source: {src_w}x{src_h}, {duration:.1f}s | vertical={already_vertical}")
+
+    # ── 0. Normalize Telegram/VFR Video ──────────────────────────────────────
+    log.info("[pipeline] Step 0: Normalize VFR ")
+    normalized_path = str(work / "normalized.mp4")
+    _run([
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-vf", "fps=30",
+        "-vsync", "cfr",
+        "-c:a", "copy",
+        normalized_path
+    ], "normalize")
+    input_path = normalized_path
+    # update fps
+    fps = 30.0
 
     # ── 1. Whisper transcription (Hinglish mode) ─────────────────────────────
     log.info("[pipeline] Step 1: Whisper transcription")
@@ -198,7 +228,7 @@ def run_pipeline(input_path: str, output_path: str, user_prefs: dict = None) -> 
     # The only robust fix: use a plain filename (no path) and run FFmpeg with
     # cwd=work so it resolves the script without any drive-letter colon.
     crop_script_name = Path(crop_script).name   # e.g. "crop_cmds.txt"
-    vf_crop = f"sendcmd=f={crop_script_name},crop=iw:ih:0:0,scale=1080:1920:flags=lanczos"
+    vf_crop = f"sendcmd=f={crop_script_name},crop=iw:ih:0:0,scale=1080:1920:flags=bicubic"
 
     ffmpeg_crop_cmd = ["ffmpeg", "-y"]
     if _device == "cuda":
@@ -222,19 +252,20 @@ def run_pipeline(input_path: str, output_path: str, user_prefs: dict = None) -> 
 
     # Build Gemma-directed zoom filter.
     # Shift zoom_cuts timestamps so they are relative to the trimmed clip.
-    trimmed_zoom_cuts = []
-    for zc in decision.zoom_cuts:
-        t_shifted = zc["time"] - trim_start
-        if 0 <= t_shifted <= (trim_end - trim_start):
-            trimmed_zoom_cuts.append({**zc, "time": t_shifted})
+    # trimmed_zoom_cuts = []
+    # for zc in decision.zoom_cuts:
+    #     t_shifted = zc["time"] - trim_start
+    #     if 0 <= t_shifted <= (trim_end - trim_start):
+    #         trimmed_zoom_cuts.append({**zc, "time": t_shifted})
 
-    trimmed_duration = trim_end - trim_start
-    zoom_filter = build_zoom_filter(trimmed_zoom_cuts, trimmed_duration, fps=fps)
-    log.info(f"[pipeline] Zoom filter built for {len(trimmed_zoom_cuts)} cuts")
+    # trimmed_duration = trim_end - trim_start
+    # zoom_filter = build_zoom_filter(trimmed_zoom_cuts, trimmed_duration, fps=fps)
+    # log.info(f"[pipeline] Zoom filter built for {len(trimmed_zoom_cuts)} cuts")
 
     # zoompan must come BEFORE ass subtitles so the zoom doesn't crop the text.
     # zoompan is CPU-only — hwaccel decode is still fine.
-    vf_chain = f"{zoom_filter},{captions}" 
+    # vf_chain = f"{zoom_filter},{captions}" 
+    vf_chain = f"{captions}"
 
     # Audio: normalize loudness + boost speech clarity
     af_chain = "loudnorm=I=-14:TP=-2:LRA=7,equalizer=f=3000:width_type=o:width=2:g=3"
