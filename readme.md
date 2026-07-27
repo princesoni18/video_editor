@@ -1,3 +1,6 @@
+#DEMO
+https://www.notion.so/AI-Video-editor-Demo-351f4cbca78a80e0adfcffd28af126f1?source=copy_link
+
 # 🎬 Smart AI Shorts Bot (Automated Video Editing Pipeline)
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
